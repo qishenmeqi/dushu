@@ -20,6 +20,8 @@
 <header class="topbar">
   <div class="brand">读书</div>
   <div class="top-actions">
+    <button id="btnFontDown" class="icon-btn" title="缩小字号" aria-label="缩小字号">A−</button>
+    <button id="btnFontUp" class="icon-btn" title="放大字号" aria-label="放大字号">A+</button>
     <button id="btnSettings" class="icon-btn" title="设置" aria-label="设置">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round">
         <path d="M4 7h9M17.5 7H20M4 17h3M11.5 17H20"/>
@@ -40,7 +42,7 @@
       </svg>
     </div>
     <h1>拍一页，念给你听</h1>
-    <p class="empty-desc">对着书页拍一张照片，原样显示在屏幕上。点图上任意一句，就从那里开始读。有插图的页面也照样显示，读的是图上的字。</p>
+    <p class="empty-desc">对着书页拍一张照片，认出文字以后，用中文语音一句一句读。可以调语速，点任意一句就从那里开始读。</p>
     <button id="btnAddEmpty" class="primary">拍一页</button>
     <p class="tip">识别全部在这台设备上完成，照片不会上传。第一次识别要多花几秒把识别引擎加载进来，之后就快了。</p>
   </section>
@@ -79,7 +81,6 @@
     </button>
   </div>
   <div class="player-status">
-    <span id="synthStatus" class="synth-status hidden">准备语音…</span>
     <span id="posText">0 / 0</span>
     <span class="dot">·</span>
     <span id="rateText">1.0 倍</span>
@@ -109,7 +110,7 @@
     </div>
 
     <div id="dictResult" class="dict-result">
-      <p class="dict-hint">输入一个词查意思和读音。也可以直接长按图上的字，会查那个字或包含它的词。</p>
+      <p class="dict-hint">输入一个词查意思和读音。也可以关掉面板，在书里选中词语，点浮出来的「查」。</p>
     </div>
   </div>
 </div>
@@ -144,9 +145,10 @@
     </label>
 
     <div class="sheet-actions">
-      <button id="btnCopy" class="ghost">复制文字</button>
+      <button id="btnEdit" class="ghost">编辑文字</button>
+      <button id="btnCopy" class="ghost">复制全文</button>
       <button id="btnDownload" class="ghost">下载 txt</button>
-      <button id="btnClear" class="danger">清空全部</button>
+      <button id="btnClear" class="danger">清空这本书</button>
     </div>
   </div>
 </div>

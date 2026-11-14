@@ -18,9 +18,9 @@ const LS = {
 };
 
 const state = {
-  pages: [],          // [{ id, order, blob, width, height, lines:[{text,bbox}] }]
-  pageUrls: [],
-  sentences: [],      // [{ text, page }]
+  text: '',
+  pages: 0,
+  sentences: [],      // { text, el }
   idx: 0,
   playing: false,
   paused: false,
@@ -45,8 +45,6 @@ const state = {
 
 /* ---------------- 启动 ---------------- */
 
-window.__dushu = state;   // 方便在控制台看状态
-
 document.addEventListener('DOMContentLoaded', init);
 
 function init() {
@@ -55,12 +53,13 @@ function init() {
   initAudio();
   restoreReading();
 
-  if (isOnlineHost()) {
-    const tip = document.querySelector('#emptyState .tip');
-    if (tip) {
-      tip.textContent =
-        '线上版第一次识别要下载约 6MB 识别包，网络慢时可能要几分钟。手机在家建议连电脑的局域网地址，会快很多。';
-    }
+  // 添加到主屏幕后可以像 app 一样全屏打开
+  if ('serviceWorker' in navigator) {
+    window.addEventListener('load', () => {
+      navigator.serviceWorker.register('sw.js').catch(() => {
+        /* 不支持就算了 */
+      });
+    });
   }
 }
 
@@ -102,82 +101,29 @@ function applyFontSize() {
   localStorage.setItem(LS.fontSize, String(state.fontSize));
 }
 
-/* ---------------- 页面存取（IndexedDB：原图 + 文字行坐标） ---------------- */
+/* ---------------- 文本存取 ---------------- */
 
-const DB_NAME = 'dushu-pages';
-const DB_STORE = 'pages';
-let dbPromise = null;
-
-function openDB() {
-  if (dbPromise) return dbPromise;
-  dbPromise = new Promise((resolve, reject) => {
-    const req = indexedDB.open(DB_NAME, 1);
-    req.onupgradeneeded = () => {
-      const db = req.result;
-      if (!db.objectStoreNames.contains(DB_STORE)) {
-        db.createObjectStore(DB_STORE, { keyPath: 'id' });
-      }
-    };
-    req.onsuccess = () => resolve(req.result);
-    req.onerror = () => reject(req.error);
-  });
-  return dbPromise;
-}
-
-function dbAll() {
-  return openDB().then(
-    (db) =>
-      new Promise((resolve, reject) => {
-        const tx = db.transaction(DB_STORE, 'readonly');
-        const req = tx.objectStore(DB_STORE).getAll();
-        req.onsuccess = () => resolve(req.result || []);
-        req.onerror = () => reject(req.error);
-      })
-  );
-}
-
-function dbPut(page) {
-  return openDB().then(
-    (db) =>
-      new Promise((resolve, reject) => {
-        const tx = db.transaction(DB_STORE, 'readwrite');
-        tx.objectStore(DB_STORE).put(page);
-        tx.oncomplete = () => resolve();
-        tx.onerror = () => reject(tx.error);
-      })
-  );
-}
-
-function dbClear() {
-  return openDB().then(
-    (db) =>
-      new Promise((resolve, reject) => {
-        const tx = db.transaction(DB_STORE, 'readwrite');
-        tx.objectStore(DB_STORE).clear();
-        tx.oncomplete = () => resolve();
-        tx.onerror = () => reject(tx.error);
-      })
-  );
-}
-
-async function restoreReading() {
+function restoreReading() {
+  state.text = localStorage.getItem(LS.text) || '';
+  state.pages = parseInt(localStorage.getItem(LS.pages) || '0', 10) || 0;
   state.idx = parseInt(localStorage.getItem(LS.idx) || '0', 10) || 0;
-  try {
-    const pages = await dbAll();
-    pages.sort((a, b) => (a.order || 0) - (b.order || 0));
-    state.pages = pages;
-  } catch (e) {
-    console.error(e);
-    state.pages = [];
-  }
-  if (state.pages.length) render();
+  if (state.text.trim()) render();
   else showEmpty();
 
-  // 本机使用时，空闲后先把语音引擎装好，第一次点播放就不用等太久
-  if (state.pages.length && !isOnlineHost()) {
+  // 本机使用时，空闲后先把语音引擎装好，第一次点播放就不用干等
+  if (state.text.trim() && !isOnlineHost()) {
     setTimeout(() => {
       if (!state.piper && !state.piperPromise) ensurePiper().catch(() => {});
     }, 2000);
+  }
+}
+
+function persistText() {
+  try {
+    localStorage.setItem(LS.text, state.text);
+    localStorage.setItem(LS.pages, String(state.pages));
+  } catch (e) {
+    toast('本机存储满了，文字可能存不下，建议先下载 txt 备份');
   }
 }
 
@@ -199,280 +145,29 @@ function showReading() {
   $('#player').classList.remove('hidden');
 }
 
-/* ---------------- 句子与行坐标 ---------------- */
-
-function splitSentencesWithPos(text) {
-  const out = [];
-  let start = 0;
-  let cur = '';
-  for (let i = 0; i < text.length; i++) {
-    const ch = text[i];
-    if (ch === '\n') {
-      if (cur) {
-        out.push({ text: cur, start, end: i });
-        cur = '';
-      }
-      start = i + 1;
-      continue;
-    }
-    cur += ch;
-    if (END_PUNCT.includes(ch)) {
-      while (i + 1 < text.length && CLOSERS.includes(text[i + 1])) {
-        cur += text[++i];
-      }
-      out.push({ text: cur, start, end: i + 1 });
-      start = i + 1;
-      cur = '';
-    }
-  }
-  if (cur) out.push({ text: cur, start, end: text.length });
-  return out;
-}
-
-function buildPageSentences(lines) {
-  let full = '';
-  const ranges = [];
-  for (let i = 0; i < lines.length; i++) {
-    const t = lines[i].text;
-    const start = full.length;
-    full += t;
-    ranges.push({ start, end: full.length });
-
-    // 标题这类短行单独成句，别和下一行正文粘在一起
-    const next = lines[i + 1];
-    if (next && t.length <= 16 && !/[。！？；：…，,、]$/.test(t)) {
-      full += '\n';
-    }
-  }
-  return { ranges, sents: splitSentencesWithPos(full) };
-}
-
-// 这一行第一个字落在哪一句里
-function sentenceIndexAtLine(sents, ranges, lineIdx) {
-  const rs = ranges[lineIdx].start;
-  for (let i = 0; i < sents.length; i++) {
-    if (sents[i].end > rs) return i;
-  }
-  return Math.max(0, sents.length - 1);
-}
-
-// 某个字符位置落在哪一行
-function lineIndexOf(ranges, pos) {
-  for (let i = 0; i < ranges.length; i++) {
-    if (pos < ranges[i].end) return i;
-  }
-  return Math.max(0, ranges.length - 1);
-}
-
-// 长按图上某个位置：先定位到那里的字，再试着凑成词典里能查到的词
-async function lookupAtPoint(page, frame, clientX, clientY) {
-  const rect = frame.getBoundingClientRect();
-  if (!rect.width || !rect.height) return;
-
-  const px = ((clientX - rect.left) / rect.width) * page.width;
-  const py = ((clientY - rect.top) / rect.height) * page.height;
-
-  let lineIdx = -1;
-  let best = Infinity;
-  (page.lines || []).forEach((line, i) => {
-    const b = line.bbox;
-    if (!b) return;
-    const cy = (b.y0 + b.y1) / 2;
-    const d = Math.abs(py - cy);
-    if (d < best) {
-      best = d;
-      lineIdx = i;
-    }
-  });
-  if (lineIdx < 0) return;
-
-  const line = page.lines[lineIdx];
-  const b = line.bbox;
-  const text = line.text;
-  if (!text) return;
-
-  const ratio = Math.min(0.999, Math.max(0, (px - b.x0) / Math.max(1, b.x1 - b.x0)));
-  const ci = Math.min(text.length - 1, Math.floor(ratio * text.length));
-
-  toast('正在查这个词…');
-  try {
-    const word = await pickDictWord(text, ci);
-    if (word) openDict(word);
-    else toast('这个位置没认出字');
-  } catch (e) {
-    console.error(e);
-    toast('查词没成功，稍后再试');
-  }
-}
-
-// 以点到的字为中心，优先取词典里能查到的 2-4 字词
-async function pickDictWord(text, ci) {
-  const isHan = (ch) => /[一-鿿]/.test(ch || '');
-
-  // 点到标点或空白时，吸附到最近的汉字
-  if (!isHan(text[ci])) {
-    let left = ci - 1;
-    let right = ci + 1;
-    let found = -1;
-    while (left >= 0 || right < text.length) {
-      if (left >= 0 && isHan(text[left])) { found = left; break; }
-      if (right < text.length && isHan(text[right])) { found = right; break; }
-      left--;
-      right++;
-    }
-    if (found < 0) return null;
-    ci = found;
-  }
-
-  const candidates = [];
-  for (let len = 4; len >= 1; len--) {
-    for (let start = Math.max(0, ci - len + 1); start <= ci; start++) {
-      if (start + len > text.length) continue;
-      const w = text.slice(start, start + len);
-      if (/^[一-鿿]+$/.test(w)) candidates.push(w);
-    }
-  }
-  for (const w of candidates) {
-    const entry = await dictLookup(w);
-    if (entry.type === '词语' || entry.type === '成语' || entry.type === '单字') return w;
-  }
-  return null;
-}
-
-/* ---------------- 渲染：直接显示原图，文字变成图上的热区 ---------------- */
+/* ---------------- 渲染 ---------------- */
 
 function render() {
   const tv = $('#textView');
   tv.innerHTML = '';
   state.sentences = [];
 
-  if (state.pageUrls && state.pageUrls.length) {
-    state.pageUrls.forEach((u) => {
-      try { URL.revokeObjectURL(u); } catch (e) { /* 忽略 */ }
-    });
-  }
-  state.pageUrls = [];
+  const paras = state.text.split(/\n{2,}/).map((s) => s.trim()).filter(Boolean);
 
-  if (!state.pages.length) {
-    showEmpty();
-    return;
-  }
-
-  state.pages.forEach((page, pi) => {
-    const { ranges, sents } = buildPageSentences(page.lines || []);
-    if (!sents.length) return;
-
-    const base = state.sentences.length;
-    sents.forEach((s) => state.sentences.push({ text: s.text, page: pi }));
-
-    const article = document.createElement('article');
-    article.className = 'page-view';
-
-    const frame = document.createElement('div');
-    frame.className = 'page-frame';
-
-    const img = document.createElement('img');
-    img.alt = `第 ${pi + 1} 页`;
-    img.loading = pi === 0 ? 'eager' : 'lazy';
-    if (page.blob) {
-      const url = URL.createObjectURL(page.blob);
-      state.pageUrls.push(url);
-      img.src = url;
+  for (const para of paras) {
+    const p = document.createElement('p');
+    p.className = 'para';
+    for (const sentence of splitSentences(para)) {
+      const span = document.createElement('span');
+      span.className = 'sent';
+      span.textContent = sentence;
+      const i = state.sentences.length;
+      span.dataset.i = String(i);
+      state.sentences.push({ text: sentence, el: span });
+      p.appendChild(span);
     }
-    frame.appendChild(img);
-
-    const overlay = document.createElement('div');
-    overlay.className = 'page-hotspots';
-
-    // 短按：从这句开始读；长按：查手指下面的字词
-    let pressTimer = null;
-    let pressOrigin = null;
-    let longPressed = false;
-
-    overlay.addEventListener('pointerdown', (e) => {
-      const hs = e.target.closest('.hs');
-      if (!hs) return;
-      const x = e.clientX;
-      const y = e.clientY;
-      longPressed = false;
-      pressOrigin = { x, y };
-      clearTimeout(pressTimer);
-      pressTimer = setTimeout(() => {
-        longPressed = true;
-        pressOrigin = null;
-        lookupAtPoint(page, frame, x, y);
-      }, 600);
-    });
-
-    overlay.addEventListener('pointermove', (e) => {
-      if (!pressOrigin) return;
-      if (Math.hypot(e.clientX - pressOrigin.x, e.clientY - pressOrigin.y) > 12) {
-        clearTimeout(pressTimer);
-        pressOrigin = null;
-      }
-    });
-
-    overlay.addEventListener('pointerup', () => {
-      clearTimeout(pressTimer);
-      pressOrigin = null;
-    });
-
-    overlay.addEventListener('pointercancel', () => {
-      clearTimeout(pressTimer);
-      pressOrigin = null;
-    });
-
-    overlay.addEventListener('click', (e) => {
-      if (longPressed) {
-        longPressed = false;
-        return;
-      }
-      const hs = e.target.closest('.hs');
-      if (!hs) return;
-      const i = parseInt(hs.dataset.sent, 10);
-      if (Number.isFinite(i)) seekTo(i);
-    });
-
-    (sents || []).forEach((s, si) => {
-      const globalIdx = base + si;
-      const startLine = lineIndexOf(ranges, s.start);
-      const endLine = lineIndexOf(ranges, Math.max(s.start, s.end - 1));
-
-      for (let li = startLine; li <= endLine; li++) {
-        const rs = ranges[li].start;
-        const re = ranges[li].end;
-        const segStart = Math.max(s.start, rs);
-        const segEnd = Math.min(s.end, re);
-        if (segEnd <= segStart) continue;
-
-        const line = page.lines[li];
-        const b = line && line.bbox;
-        if (!b) continue;
-
-        // 按字符比例算出这句话在这一行里的左右边界
-        const span = Math.max(1, re - rs);
-        const r0 = (segStart - rs) / span;
-        const r1 = (segEnd - rs) / span;
-        const x0 = b.x0 + (b.x1 - b.x0) * r0;
-        const x1 = b.x0 + (b.x1 - b.x0) * r1;
-
-        const hs = document.createElement('div');
-        hs.className = 'hs';
-        hs.style.left = (x0 / page.width) * 100 + '%';
-        hs.style.top = (b.y0 / page.height) * 100 + '%';
-        hs.style.width = Math.max(0.6, ((x1 - x0) / page.width) * 100) + '%';
-        hs.style.height = ((b.y1 - b.y0) / page.height) * 100 + '%';
-        hs.dataset.sent = String(globalIdx);
-        hs.setAttribute('role', 'button');
-        hs.setAttribute('aria-label', s.text);
-        overlay.appendChild(hs);
-      }
-    });
-
-    frame.appendChild(overlay);
-    article.appendChild(frame);
-    tv.appendChild(article);
-  });
+    tv.appendChild(p);
+  }
 
   if (!state.sentences.length) {
     showEmpty();
@@ -482,29 +177,28 @@ function render() {
   if (state.idx >= state.sentences.length) state.idx = 0;
   if (state.idx < 0) state.idx = 0;
 
-  $('#pageCount').textContent = `共 ${state.pages.length} 页`;
+  $('#pageCount').textContent = state.pages > 0 ? `共 ${state.pages} 页` : '';
   updateActive();
   showReading();
 }
 
 function updateActive() {
-  document.querySelectorAll('.hs.active').forEach((el) => el.classList.remove('active'));
-  const list = document.querySelectorAll(`.hs[data-sent="${state.idx}"]`);
-  list.forEach((el) => el.classList.add('active'));
-
+  document.querySelectorAll('.sent.active').forEach((el) => el.classList.remove('active'));
+  const s = state.sentences[state.idx];
+  if (s) s.el.classList.add('active');
   $('#posText').textContent = state.sentences.length
     ? `${state.idx + 1} / ${state.sentences.length}`
     : '0 / 0';
   saveIdx();
-  return list;
 }
 
 function setCurrent(i, opts) {
   if (!state.sentences.length) return;
   state.idx = Math.max(0, Math.min(i, state.sentences.length - 1));
-  const list = updateActive();
-  if (opts && opts.scroll && state.autoScroll && list && list.length) {
-    list[0].scrollIntoView({ block: 'center', behavior: 'smooth' });
+  updateActive();
+  if (opts && opts.scroll && state.autoScroll) {
+    const el = state.sentences[state.idx].el;
+    el.scrollIntoView({ block: 'center', behavior: 'smooth' });
   }
 }
 
@@ -671,11 +365,6 @@ function clearAudioCache() {
   state.audioCache.clear();
 }
 
-function setSynthStatus(on) {
-  const el = $('#synthStatus');
-  if (el) el.classList.toggle('hidden', !on);
-}
-
 async function playCurrentSentence() {
   if (!state.playing || state.paused) return;
   if (!state.sentences.length) return;
@@ -690,16 +379,10 @@ async function playCurrentSentence() {
 
   setCurrent(idx, { scroll: true });
 
-  const playBtn = $('#btnPlay');
-  if (playBtn) playBtn.classList.add('loading');
-  setSynthStatus(true);
-
   let item;
   try {
     item = await getAudioFor(idx);
   } catch (e) {
-    if (playBtn) playBtn.classList.remove('loading');
-    setSynthStatus(false);
     if (token !== state.synthToken) return;
     console.error(e);
     if (state.piperFailed) {
@@ -710,8 +393,6 @@ async function playCurrentSentence() {
     skipToNext();
     return;
   }
-  if (playBtn) playBtn.classList.remove('loading');
-  setSynthStatus(false);
 
   if (token !== state.synthToken || !state.playing || state.idx !== idx) return;
 
@@ -720,11 +401,6 @@ async function playCurrentSentence() {
   audio.volume = state.volume;
   audio.play().catch((err) => {
     console.error(err);
-    const msg =
-      err && err.name === 'NotAllowedError'
-        ? '浏览器拦住了播放，点一下播放键再试'
-        : '音频没播出来，检查一下系统音量和标签页是否静音';
-    toast(msg);
     if (state.playing && !state.paused) skipToNext();
   });
 
@@ -777,14 +453,7 @@ function playFromCurrent() {
   requestWakeLock();
 
   if (!state.piper && !state.piperPromise) {
-    if (isOnlineHost()) {
-      toast('线上语音包有 155MB，要下载很久。想听朗读建议用电脑本地的地址');
-    } else {
-      toast('正在加载离线语音，第一次要十几秒');
-    }
-  }
-  if (state.volume === 0) {
-    toast('音量是 0，先在设置里把音量拉大');
+    toast('正在加载离线语音，第一次要十几秒');
   }
 
   playCurrentSentence();
@@ -807,9 +476,6 @@ function stopSpeech() {
   state.finished = false;
   state.synthToken++;
   if (state.audio) state.audio.pause();
-  const playBtn = $('#btnPlay');
-  if (playBtn) playBtn.classList.remove('loading');
-  setSynthStatus(false);
   updatePlayButton();
   releaseWakeLock();
 }
@@ -820,9 +486,6 @@ function finishPlayback() {
   state.finished = true;
   state.synthToken++;
   if (state.audio) state.audio.pause();
-  const playBtn = $('#btnPlay');
-  if (playBtn) playBtn.classList.remove('loading');
-  setSynthStatus(false);
   updatePlayButton();
   releaseWakeLock();
   setCurrent(state.sentences.length - 1);
@@ -907,7 +570,7 @@ function onOcrProgress(m) {
 
 const ASSET_BASE = new URL('.', location.href).href;   // 页面所在目录，末尾带斜杠
 
-// 线上访问时网络往往很慢，用精简语言包（1.7MB）而不是完整版（11.4MB）
+// 线上访问时网络往往很慢，用精简语言包（1.7MB）；本机用完整版（11.4MB），认得更准
 function isOnlineHost() {
   const h = location.hostname;
   return !(
@@ -1011,21 +674,15 @@ async function handleFiles(fileList) {
 
       const img = await loadImage(files[i]);
       const canvas = preprocess(img);
-      const result = await worker.recognize(canvas, {}, { blocks: true, text: true });
+      const result = await worker.recognize(canvas);
       if (state.canceled) break;
 
-      const lines = extractLines(result && result.data);
+      const pageText = cleanPageText((result && result.data && result.data.text) || '');
 
-      if (!lines.length) {
+      if (pageText.replace(/\s/g, '').length < 4) {
         toast('这一页没认出字。试试光线亮一点，镜头正对书页，拍得平整些');
       } else {
-        const blob = await canvasToBlob(canvas);
-        await addPage({
-          blob,
-          width: canvas.width,
-          height: canvas.height,
-          lines,
-        });
+        appendPage(pageText);
         done++;
       }
 
@@ -1207,47 +864,28 @@ function cleanPageText(raw) {
   return paras.filter(Boolean).join('\n\n').trim();
 }
 
-function canvasToBlob(canvas) {
-  return new Promise((resolve) => {
-    if (!canvas.toBlob) {
-      resolve(null);
-      return;
-    }
-    canvas.toBlob((b) => resolve(b), 'image/jpeg', 0.85);
-  });
+function appendPage(pageText) {
+  const clean = pageText.trim();
+  if (!clean) return;
+  state.text = state.text.trim() ? state.text.trim() + '\n\n' + clean : clean;
+  state.pages += 1;
+  persistText();
+  render();
 }
 
-// 从识别结果里取出每一行的文字和坐标
-function extractLines(data) {
-  const out = [];
-  const blocks = (data && data.blocks) || [];
-  for (const block of blocks) {
-    for (const para of block.paragraphs || []) {
-      for (const line of para.lines || []) {
-        const text = cleanLine(line.text || '');
-        if (!text) continue;
-        if (isPageNumberLine(text)) continue;
-        const b = line.bbox;
-        if (!b || b.x1 <= b.x0 || b.y1 <= b.y0) continue;
-        out.push({ text, bbox: { x0: b.x0, y0: b.y0, x1: b.x1, y1: b.y1 } });
-      }
-    }
-  }
-  return out;
-}
-
-async function addPage(page) {
-  const existing = await dbAll();
-  const order = existing.reduce((m, p) => Math.max(m, p.order || 0), 0) + 1;
-  const id = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
-  await dbPut({ id, order, ...page });
-  await restoreReading();
-}
-
-/* ---------------- 编辑（图片模式下不再直接改文字） ---------------- */
+/* ---------------- 编辑 ---------------- */
 
 function openEditor() {
-  toast('现在是图片阅读，文字不能直接改');
+  if (!state.text.trim()) {
+    toast('还没有文字，先拍一页');
+    return;
+  }
+  document.body.classList.add('editing');
+  $('#editArea').value = state.text;
+  $('#textView').classList.add('hidden');
+  $('#editWrap').classList.remove('hidden');
+  closeSettings();
+  $('#editArea').focus();
 }
 
 function cancelEditor() {
@@ -1257,30 +895,42 @@ function cancelEditor() {
 }
 
 function saveEditor() {
-  cancelEditor();
+  const raw = $('#editArea').value.replace(/\r/g, '');
+  const text = raw
+    .split('\n')
+    .map((s) => s.replace(/\s+$/, ''))
+    .join('\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+
+  state.text = text;
+  if (!text) {
+    localStorage.removeItem(LS.text);
+  }
+  persistText();
+  document.body.classList.remove('editing');
+  $('#editWrap').classList.add('hidden');
+  $('#textView').classList.remove('hidden');
+  stopSpeech();
+  state.idx = 0;
+  if (text) render();
+  else showEmpty();
+  toast('已经保存');
 }
 
 /* ---------------- 工具栏动作 ---------------- */
 
-function allText() {
-  return state.pages
-    .map((p) => (p.lines || []).map((l) => l.text).join('\n'))
-    .join('\n\n')
-    .trim();
-}
-
 async function copyAll() {
-  const text = allText();
-  if (!text) {
+  if (!state.text.trim()) {
     toast('还没有文字');
     return;
   }
   try {
-    await navigator.clipboard.writeText(text);
+    await navigator.clipboard.writeText(state.text);
     toast('已复制全文');
   } catch (e) {
     const ta = document.createElement('textarea');
-    ta.value = text;
+    ta.value = state.text;
     ta.style.position = 'fixed';
     ta.style.opacity = '0';
     document.body.appendChild(ta);
@@ -1288,17 +938,16 @@ async function copyAll() {
     let ok = false;
     try { ok = document.execCommand('copy'); } catch (_) { ok = false; }
     ta.remove();
-    toast(ok ? '已复制全文' : '复制失败');
+    toast(ok ? '已复制全文' : '复制失败，可以进编辑里手动复制');
   }
 }
 
 function downloadTxt() {
-  const text = allText();
-  if (!text) {
+  if (!state.text.trim()) {
     toast('还没有文字');
     return;
   }
-  const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
+  const blob = new Blob([state.text], { type: 'text/plain;charset=utf-8' });
   const url = URL.createObjectURL(blob);
   const d = new Date();
   const stamp = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
@@ -1311,28 +960,22 @@ function downloadTxt() {
   setTimeout(() => URL.revokeObjectURL(url), 2000);
 }
 
-async function clearAll() {
-  if (!state.pages.length) {
+function clearAll() {
+  if (!state.text.trim() && !state.pages) {
     toast('现在是空的');
     return;
   }
-  if (!window.confirm('确定清空全部页面吗？图片和文字都会删掉，找不回来。')) return;
+  if (!window.confirm('确定清空这本书的全部文字吗？清空后找不回来。')) return;
 
   stopSpeech();
-  state.pages = [];
+  state.text = '';
+  state.pages = 0;
   state.idx = 0;
   state.finished = false;
   state.sentences = [];
-  try { await dbClear(); } catch (e) { console.error(e); }
   localStorage.removeItem(LS.text);
   localStorage.removeItem(LS.pages);
   localStorage.removeItem(LS.idx);
-  if (state.pageUrls) {
-    state.pageUrls.forEach((u) => {
-      try { URL.revokeObjectURL(u); } catch (e) { /* 忽略 */ }
-    });
-    state.pageUrls = [];
-  }
   $('#textView').innerHTML = '';
   closeSettings();
   showEmpty();
@@ -1899,6 +1542,16 @@ function bindEvents() {
     if (Number.isFinite(i)) seekTo(i);
   });
 
+  // 字号
+  $('#btnFontUp').addEventListener('click', () => {
+    state.fontSize = Math.min(30, state.fontSize + 1);
+    applyFontSize();
+  });
+  $('#btnFontDown').addEventListener('click', () => {
+    state.fontSize = Math.max(15, state.fontSize - 1);
+    applyFontSize();
+  });
+
   // 设置
   $('#btnSettings').addEventListener('click', openSettings);
   $('#btnCloseSettings').addEventListener('click', closeSettings);
@@ -1925,6 +1578,9 @@ function bindEvents() {
     localStorage.setItem(LS.autoScroll, state.autoScroll ? '1' : '0');
   });
 
+  $('#btnEdit').addEventListener('click', openEditor);
+  $('#btnEditCancel').addEventListener('click', cancelEditor);
+  $('#btnEditSave').addEventListener('click', saveEditor);
   $('#btnCopy').addEventListener('click', copyAll);
   $('#btnDownload').addEventListener('click', downloadTxt);
   $('#btnClear').addEventListener('click', clearAll);
@@ -1993,14 +1649,5 @@ function bindEvents() {
     if (!document.hidden && state.playing && !state.paused && state.audio && state.audio.paused) {
       state.audio.play().catch(() => {});
     }
-  });
-}
-
-// 注册 Service Worker：添加到主屏幕后可以像 app 一样全屏打开
-if ('serviceWorker' in navigator) {
-  window.addEventListener('load', () => {
-    navigator.serviceWorker.register('sw.js').catch(() => {
-      /* 不支持就算了，不影响网页使用 */
-    });
   });
 }
