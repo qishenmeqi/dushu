@@ -45,6 +45,8 @@ const state = {
 
 /* ---------------- 启动 ---------------- */
 
+window.__dushu = state;   // 方便在控制台看状态
+
 document.addEventListener('DOMContentLoaded', init);
 
 function init() {
@@ -255,6 +257,81 @@ function lineIndexOf(ranges, pos) {
   return Math.max(0, ranges.length - 1);
 }
 
+// 长按图上某个位置：先定位到那里的字，再试着凑成词典里能查到的词
+async function lookupAtPoint(page, frame, clientX, clientY) {
+  const rect = frame.getBoundingClientRect();
+  if (!rect.width || !rect.height) return;
+
+  const px = ((clientX - rect.left) / rect.width) * page.width;
+  const py = ((clientY - rect.top) / rect.height) * page.height;
+
+  let lineIdx = -1;
+  let best = Infinity;
+  (page.lines || []).forEach((line, i) => {
+    const b = line.bbox;
+    if (!b) return;
+    const cy = (b.y0 + b.y1) / 2;
+    const d = Math.abs(py - cy);
+    if (d < best) {
+      best = d;
+      lineIdx = i;
+    }
+  });
+  if (lineIdx < 0) return;
+
+  const line = page.lines[lineIdx];
+  const b = line.bbox;
+  const text = line.text;
+  if (!text) return;
+
+  const ratio = Math.min(0.999, Math.max(0, (px - b.x0) / Math.max(1, b.x1 - b.x0)));
+  const ci = Math.min(text.length - 1, Math.floor(ratio * text.length));
+
+  toast('正在查这个词…');
+  try {
+    const word = await pickDictWord(text, ci);
+    if (word) openDict(word);
+    else toast('这个位置没认出字');
+  } catch (e) {
+    console.error(e);
+    toast('查词没成功，稍后再试');
+  }
+}
+
+// 以点到的字为中心，优先取词典里能查到的 2-4 字词
+async function pickDictWord(text, ci) {
+  const isHan = (ch) => /[一-鿿]/.test(ch || '');
+
+  // 点到标点或空白时，吸附到最近的汉字
+  if (!isHan(text[ci])) {
+    let left = ci - 1;
+    let right = ci + 1;
+    let found = -1;
+    while (left >= 0 || right < text.length) {
+      if (left >= 0 && isHan(text[left])) { found = left; break; }
+      if (right < text.length && isHan(text[right])) { found = right; break; }
+      left--;
+      right++;
+    }
+    if (found < 0) return null;
+    ci = found;
+  }
+
+  const candidates = [];
+  for (let len = 4; len >= 1; len--) {
+    for (let start = Math.max(0, ci - len + 1); start <= ci; start++) {
+      if (start + len > text.length) continue;
+      const w = text.slice(start, start + len);
+      if (/^[一-鿿]+$/.test(w)) candidates.push(w);
+    }
+  }
+  for (const w of candidates) {
+    const entry = await dictLookup(w);
+    if (entry.type === '词语' || entry.type === '成语' || entry.type === '单字') return w;
+  }
+  return null;
+}
+
 /* ---------------- 渲染：直接显示原图，文字变成图上的热区 ---------------- */
 
 function render() {
@@ -300,8 +377,49 @@ function render() {
     const overlay = document.createElement('div');
     overlay.className = 'page-hotspots';
 
-    // 点图上任意一段文字，就从那里开始读
+    // 短按：从这句开始读；长按：查手指下面的字词
+    let pressTimer = null;
+    let pressOrigin = null;
+    let longPressed = false;
+
+    overlay.addEventListener('pointerdown', (e) => {
+      const hs = e.target.closest('.hs');
+      if (!hs) return;
+      const x = e.clientX;
+      const y = e.clientY;
+      longPressed = false;
+      pressOrigin = { x, y };
+      clearTimeout(pressTimer);
+      pressTimer = setTimeout(() => {
+        longPressed = true;
+        pressOrigin = null;
+        lookupAtPoint(page, frame, x, y);
+      }, 600);
+    });
+
+    overlay.addEventListener('pointermove', (e) => {
+      if (!pressOrigin) return;
+      if (Math.hypot(e.clientX - pressOrigin.x, e.clientY - pressOrigin.y) > 12) {
+        clearTimeout(pressTimer);
+        pressOrigin = null;
+      }
+    });
+
+    overlay.addEventListener('pointerup', () => {
+      clearTimeout(pressTimer);
+      pressOrigin = null;
+    });
+
+    overlay.addEventListener('pointercancel', () => {
+      clearTimeout(pressTimer);
+      pressOrigin = null;
+    });
+
     overlay.addEventListener('click', (e) => {
+      if (longPressed) {
+        longPressed = false;
+        return;
+      }
       const hs = e.target.closest('.hs');
       if (!hs) return;
       const i = parseInt(hs.dataset.sent, 10);
@@ -560,10 +678,14 @@ async function playCurrentSentence() {
 
   setCurrent(idx, { scroll: true });
 
+  const playBtn = $('#btnPlay');
+  if (playBtn) playBtn.classList.add('loading');
+
   let item;
   try {
     item = await getAudioFor(idx);
   } catch (e) {
+    if (playBtn) playBtn.classList.remove('loading');
     if (token !== state.synthToken) return;
     console.error(e);
     if (state.piperFailed) {
@@ -574,6 +696,7 @@ async function playCurrentSentence() {
     skipToNext();
     return;
   }
+  if (playBtn) playBtn.classList.remove('loading');
 
   if (token !== state.synthToken || !state.playing || state.idx !== idx) return;
 
@@ -582,6 +705,11 @@ async function playCurrentSentence() {
   audio.volume = state.volume;
   audio.play().catch((err) => {
     console.error(err);
+    const msg =
+      err && err.name === 'NotAllowedError'
+        ? '浏览器拦住了播放，点一下播放键再试'
+        : '音频没播出来，检查一下系统音量和标签页是否静音';
+    toast(msg);
     if (state.playing && !state.paused) skipToNext();
   });
 
@@ -636,6 +764,9 @@ function playFromCurrent() {
   if (!state.piper && !state.piperPromise) {
     toast('正在加载离线语音，第一次要十几秒');
   }
+  if (state.volume === 0) {
+    toast('音量是 0，先在设置里把音量拉大');
+  }
 
   playCurrentSentence();
 }
@@ -657,6 +788,8 @@ function stopSpeech() {
   state.finished = false;
   state.synthToken++;
   if (state.audio) state.audio.pause();
+  const playBtn = $('#btnPlay');
+  if (playBtn) playBtn.classList.remove('loading');
   updatePlayButton();
   releaseWakeLock();
 }
@@ -667,6 +800,8 @@ function finishPlayback() {
   state.finished = true;
   state.synthToken++;
   if (state.audio) state.audio.pause();
+  const playBtn = $('#btnPlay');
+  if (playBtn) playBtn.classList.remove('loading');
   updatePlayButton();
   releaseWakeLock();
   setCurrent(state.sentences.length - 1);
