@@ -1,0 +1,9 @@
+# 系统文件
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# 临时和日志
+*.log
+_tmp*
+node_modules/
