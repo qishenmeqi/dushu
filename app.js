@@ -18,9 +18,9 @@ const LS = {
 };
 
 const state = {
-  text: '',
-  pages: 0,
-  sentences: [],      // { text, el }
+  pages: [],          // [{ id, order, blob, width, height, lines:[{text,bbox}] }]
+  pageUrls: [],
+  sentences: [],      // [{ text, page }]
   idx: 0,
   playing: false,
   paused: false,
@@ -92,23 +92,76 @@ function applyFontSize() {
   localStorage.setItem(LS.fontSize, String(state.fontSize));
 }
 
-/* ---------------- 文本存取 ---------------- */
+/* ---------------- 页面存取（IndexedDB：原图 + 文字行坐标） ---------------- */
 
-function restoreReading() {
-  state.text = localStorage.getItem(LS.text) || '';
-  state.pages = parseInt(localStorage.getItem(LS.pages) || '0', 10) || 0;
-  state.idx = parseInt(localStorage.getItem(LS.idx) || '0', 10) || 0;
-  if (state.text.trim()) render();
-  else showEmpty();
+const DB_NAME = 'dushu-pages';
+const DB_STORE = 'pages';
+let dbPromise = null;
+
+function openDB() {
+  if (dbPromise) return dbPromise;
+  dbPromise = new Promise((resolve, reject) => {
+    const req = indexedDB.open(DB_NAME, 1);
+    req.onupgradeneeded = () => {
+      const db = req.result;
+      if (!db.objectStoreNames.contains(DB_STORE)) {
+        db.createObjectStore(DB_STORE, { keyPath: 'id' });
+      }
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+  return dbPromise;
 }
 
-function persistText() {
+function dbAll() {
+  return openDB().then(
+    (db) =>
+      new Promise((resolve, reject) => {
+        const tx = db.transaction(DB_STORE, 'readonly');
+        const req = tx.objectStore(DB_STORE).getAll();
+        req.onsuccess = () => resolve(req.result || []);
+        req.onerror = () => reject(req.error);
+      })
+  );
+}
+
+function dbPut(page) {
+  return openDB().then(
+    (db) =>
+      new Promise((resolve, reject) => {
+        const tx = db.transaction(DB_STORE, 'readwrite');
+        tx.objectStore(DB_STORE).put(page);
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => reject(tx.error);
+      })
+  );
+}
+
+function dbClear() {
+  return openDB().then(
+    (db) =>
+      new Promise((resolve, reject) => {
+        const tx = db.transaction(DB_STORE, 'readwrite');
+        tx.objectStore(DB_STORE).clear();
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => reject(tx.error);
+      })
+  );
+}
+
+async function restoreReading() {
+  state.idx = parseInt(localStorage.getItem(LS.idx) || '0', 10) || 0;
   try {
-    localStorage.setItem(LS.text, state.text);
-    localStorage.setItem(LS.pages, String(state.pages));
+    const pages = await dbAll();
+    pages.sort((a, b) => (a.order || 0) - (b.order || 0));
+    state.pages = pages;
   } catch (e) {
-    toast('本机存储满了，文字可能存不下，建议先下载 txt 备份');
+    console.error(e);
+    state.pages = [];
   }
+  if (state.pages.length) render();
+  else showEmpty();
 }
 
 function saveIdx() {
@@ -129,29 +182,164 @@ function showReading() {
   $('#player').classList.remove('hidden');
 }
 
-/* ---------------- 渲染 ---------------- */
+/* ---------------- 句子与行坐标 ---------------- */
+
+function splitSentencesWithPos(text) {
+  const out = [];
+  let start = 0;
+  let cur = '';
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (ch === '\n') {
+      if (cur) {
+        out.push({ text: cur, start, end: i });
+        cur = '';
+      }
+      start = i + 1;
+      continue;
+    }
+    cur += ch;
+    if (END_PUNCT.includes(ch)) {
+      while (i + 1 < text.length && CLOSERS.includes(text[i + 1])) {
+        cur += text[++i];
+      }
+      out.push({ text: cur, start, end: i + 1 });
+      start = i + 1;
+      cur = '';
+    }
+  }
+  if (cur) out.push({ text: cur, start, end: text.length });
+  return out;
+}
+
+function buildPageSentences(lines) {
+  let full = '';
+  const ranges = [];
+  for (let i = 0; i < lines.length; i++) {
+    const t = lines[i].text;
+    const start = full.length;
+    full += t;
+    ranges.push({ start, end: full.length });
+
+    // 标题这类短行单独成句，别和下一行正文粘在一起
+    const next = lines[i + 1];
+    if (next && t.length <= 16 && !/[。！？；：…，,、]$/.test(t)) {
+      full += '\n';
+    }
+  }
+  return { ranges, sents: splitSentencesWithPos(full) };
+}
+
+// 这一行第一个字落在哪一句里
+function sentenceIndexAtLine(sents, ranges, lineIdx) {
+  const rs = ranges[lineIdx].start;
+  for (let i = 0; i < sents.length; i++) {
+    if (sents[i].end > rs) return i;
+  }
+  return Math.max(0, sents.length - 1);
+}
+
+// 某个字符位置落在哪一行
+function lineIndexOf(ranges, pos) {
+  for (let i = 0; i < ranges.length; i++) {
+    if (pos < ranges[i].end) return i;
+  }
+  return Math.max(0, ranges.length - 1);
+}
+
+/* ---------------- 渲染：直接显示原图，文字变成图上的热区 ---------------- */
 
 function render() {
   const tv = $('#textView');
   tv.innerHTML = '';
   state.sentences = [];
 
-  const paras = state.text.split(/\n{2,}/).map((s) => s.trim()).filter(Boolean);
-
-  for (const para of paras) {
-    const p = document.createElement('p');
-    p.className = 'para';
-    for (const sentence of splitSentences(para)) {
-      const span = document.createElement('span');
-      span.className = 'sent';
-      span.textContent = sentence;
-      const i = state.sentences.length;
-      span.dataset.i = String(i);
-      state.sentences.push({ text: sentence, el: span });
-      p.appendChild(span);
-    }
-    tv.appendChild(p);
+  if (state.pageUrls && state.pageUrls.length) {
+    state.pageUrls.forEach((u) => {
+      try { URL.revokeObjectURL(u); } catch (e) { /* 忽略 */ }
+    });
   }
+  state.pageUrls = [];
+
+  if (!state.pages.length) {
+    showEmpty();
+    return;
+  }
+
+  state.pages.forEach((page, pi) => {
+    const { ranges, sents } = buildPageSentences(page.lines || []);
+    if (!sents.length) return;
+
+    const base = state.sentences.length;
+    sents.forEach((s) => state.sentences.push({ text: s.text, page: pi }));
+
+    const article = document.createElement('article');
+    article.className = 'page-view';
+
+    const frame = document.createElement('div');
+    frame.className = 'page-frame';
+
+    const img = document.createElement('img');
+    img.alt = `第 ${pi + 1} 页`;
+    img.loading = pi === 0 ? 'eager' : 'lazy';
+    if (page.blob) {
+      const url = URL.createObjectURL(page.blob);
+      state.pageUrls.push(url);
+      img.src = url;
+    }
+    frame.appendChild(img);
+
+    const overlay = document.createElement('div');
+    overlay.className = 'page-hotspots';
+
+    // 点图上任意一段文字，就从那里开始读
+    overlay.addEventListener('click', (e) => {
+      const hs = e.target.closest('.hs');
+      if (!hs) return;
+      const i = parseInt(hs.dataset.sent, 10);
+      if (Number.isFinite(i)) seekTo(i);
+    });
+
+    (sents || []).forEach((s, si) => {
+      const globalIdx = base + si;
+      const startLine = lineIndexOf(ranges, s.start);
+      const endLine = lineIndexOf(ranges, Math.max(s.start, s.end - 1));
+
+      for (let li = startLine; li <= endLine; li++) {
+        const rs = ranges[li].start;
+        const re = ranges[li].end;
+        const segStart = Math.max(s.start, rs);
+        const segEnd = Math.min(s.end, re);
+        if (segEnd <= segStart) continue;
+
+        const line = page.lines[li];
+        const b = line && line.bbox;
+        if (!b) continue;
+
+        // 按字符比例算出这句话在这一行里的左右边界
+        const span = Math.max(1, re - rs);
+        const r0 = (segStart - rs) / span;
+        const r1 = (segEnd - rs) / span;
+        const x0 = b.x0 + (b.x1 - b.x0) * r0;
+        const x1 = b.x0 + (b.x1 - b.x0) * r1;
+
+        const hs = document.createElement('div');
+        hs.className = 'hs';
+        hs.style.left = (x0 / page.width) * 100 + '%';
+        hs.style.top = (b.y0 / page.height) * 100 + '%';
+        hs.style.width = Math.max(0.6, ((x1 - x0) / page.width) * 100) + '%';
+        hs.style.height = ((b.y1 - b.y0) / page.height) * 100 + '%';
+        hs.dataset.sent = String(globalIdx);
+        hs.setAttribute('role', 'button');
+        hs.setAttribute('aria-label', s.text);
+        overlay.appendChild(hs);
+      }
+    });
+
+    frame.appendChild(overlay);
+    article.appendChild(frame);
+    tv.appendChild(article);
+  });
 
   if (!state.sentences.length) {
     showEmpty();
@@ -161,28 +349,29 @@ function render() {
   if (state.idx >= state.sentences.length) state.idx = 0;
   if (state.idx < 0) state.idx = 0;
 
-  $('#pageCount').textContent = state.pages > 0 ? `共 ${state.pages} 页` : '';
+  $('#pageCount').textContent = `共 ${state.pages.length} 页`;
   updateActive();
   showReading();
 }
 
 function updateActive() {
-  document.querySelectorAll('.sent.active').forEach((el) => el.classList.remove('active'));
-  const s = state.sentences[state.idx];
-  if (s) s.el.classList.add('active');
+  document.querySelectorAll('.hs.active').forEach((el) => el.classList.remove('active'));
+  const list = document.querySelectorAll(`.hs[data-sent="${state.idx}"]`);
+  list.forEach((el) => el.classList.add('active'));
+
   $('#posText').textContent = state.sentences.length
     ? `${state.idx + 1} / ${state.sentences.length}`
     : '0 / 0';
   saveIdx();
+  return list;
 }
 
 function setCurrent(i, opts) {
   if (!state.sentences.length) return;
   state.idx = Math.max(0, Math.min(i, state.sentences.length - 1));
-  updateActive();
-  if (opts && opts.scroll && state.autoScroll) {
-    const el = state.sentences[state.idx].el;
-    el.scrollIntoView({ block: 'center', behavior: 'smooth' });
+  const list = updateActive();
+  if (opts && opts.scroll && state.autoScroll && list && list.length) {
+    list[0].scrollIntoView({ block: 'center', behavior: 'smooth' });
   }
 }
 
@@ -606,15 +795,21 @@ async function handleFiles(fileList) {
 
       const img = await loadImage(files[i]);
       const canvas = preprocess(img);
-      const result = await worker.recognize(canvas);
+      const result = await worker.recognize(canvas, {}, { blocks: true, text: true });
       if (state.canceled) break;
 
-      const pageText = cleanPageText((result && result.data && result.data.text) || '');
+      const lines = extractLines(result && result.data);
 
-      if (pageText.replace(/\s/g, '').length < 4) {
+      if (!lines.length) {
         toast('这一页没认出字。试试光线亮一点，镜头正对书页，拍得平整些');
       } else {
-        appendPage(pageText);
+        const blob = await canvasToBlob(canvas);
+        await addPage({
+          blob,
+          width: canvas.width,
+          height: canvas.height,
+          lines,
+        });
         done++;
       }
 
@@ -796,28 +991,47 @@ function cleanPageText(raw) {
   return paras.filter(Boolean).join('\n\n').trim();
 }
 
-function appendPage(pageText) {
-  const clean = pageText.trim();
-  if (!clean) return;
-  state.text = state.text.trim() ? state.text.trim() + '\n\n' + clean : clean;
-  state.pages += 1;
-  persistText();
-  render();
+function canvasToBlob(canvas) {
+  return new Promise((resolve) => {
+    if (!canvas.toBlob) {
+      resolve(null);
+      return;
+    }
+    canvas.toBlob((b) => resolve(b), 'image/jpeg', 0.85);
+  });
 }
 
-/* ---------------- 编辑 ---------------- */
+// 从识别结果里取出每一行的文字和坐标
+function extractLines(data) {
+  const out = [];
+  const blocks = (data && data.blocks) || [];
+  for (const block of blocks) {
+    for (const para of block.paragraphs || []) {
+      for (const line of para.lines || []) {
+        const text = cleanLine(line.text || '');
+        if (!text) continue;
+        if (isPageNumberLine(text)) continue;
+        const b = line.bbox;
+        if (!b || b.x1 <= b.x0 || b.y1 <= b.y0) continue;
+        out.push({ text, bbox: { x0: b.x0, y0: b.y0, x1: b.x1, y1: b.y1 } });
+      }
+    }
+  }
+  return out;
+}
+
+async function addPage(page) {
+  const existing = await dbAll();
+  const order = existing.reduce((m, p) => Math.max(m, p.order || 0), 0) + 1;
+  const id = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+  await dbPut({ id, order, ...page });
+  await restoreReading();
+}
+
+/* ---------------- 编辑（图片模式下不再直接改文字） ---------------- */
 
 function openEditor() {
-  if (!state.text.trim()) {
-    toast('还没有文字，先拍一页');
-    return;
-  }
-  document.body.classList.add('editing');
-  $('#editArea').value = state.text;
-  $('#textView').classList.add('hidden');
-  $('#editWrap').classList.remove('hidden');
-  closeSettings();
-  $('#editArea').focus();
+  toast('现在是图片阅读，文字不能直接改');
 }
 
 function cancelEditor() {
@@ -827,42 +1041,30 @@ function cancelEditor() {
 }
 
 function saveEditor() {
-  const raw = $('#editArea').value.replace(/\r/g, '');
-  const text = raw
-    .split('\n')
-    .map((s) => s.replace(/\s+$/, ''))
-    .join('\n')
-    .replace(/\n{3,}/g, '\n\n')
-    .trim();
-
-  state.text = text;
-  if (!text) {
-    localStorage.removeItem(LS.text);
-  }
-  persistText();
-  document.body.classList.remove('editing');
-  $('#editWrap').classList.add('hidden');
-  $('#textView').classList.remove('hidden');
-  stopSpeech();
-  state.idx = 0;
-  if (text) render();
-  else showEmpty();
-  toast('已经保存');
+  cancelEditor();
 }
 
 /* ---------------- 工具栏动作 ---------------- */
 
+function allText() {
+  return state.pages
+    .map((p) => (p.lines || []).map((l) => l.text).join('\n'))
+    .join('\n\n')
+    .trim();
+}
+
 async function copyAll() {
-  if (!state.text.trim()) {
+  const text = allText();
+  if (!text) {
     toast('还没有文字');
     return;
   }
   try {
-    await navigator.clipboard.writeText(state.text);
+    await navigator.clipboard.writeText(text);
     toast('已复制全文');
   } catch (e) {
     const ta = document.createElement('textarea');
-    ta.value = state.text;
+    ta.value = text;
     ta.style.position = 'fixed';
     ta.style.opacity = '0';
     document.body.appendChild(ta);
@@ -870,16 +1072,17 @@ async function copyAll() {
     let ok = false;
     try { ok = document.execCommand('copy'); } catch (_) { ok = false; }
     ta.remove();
-    toast(ok ? '已复制全文' : '复制失败，可以进编辑里手动复制');
+    toast(ok ? '已复制全文' : '复制失败');
   }
 }
 
 function downloadTxt() {
-  if (!state.text.trim()) {
+  const text = allText();
+  if (!text) {
     toast('还没有文字');
     return;
   }
-  const blob = new Blob([state.text], { type: 'text/plain;charset=utf-8' });
+  const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
   const url = URL.createObjectURL(blob);
   const d = new Date();
   const stamp = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
@@ -892,22 +1095,28 @@ function downloadTxt() {
   setTimeout(() => URL.revokeObjectURL(url), 2000);
 }
 
-function clearAll() {
-  if (!state.text.trim() && !state.pages) {
+async function clearAll() {
+  if (!state.pages.length) {
     toast('现在是空的');
     return;
   }
-  if (!window.confirm('确定清空这本书的全部文字吗？清空后找不回来。')) return;
+  if (!window.confirm('确定清空全部页面吗？图片和文字都会删掉，找不回来。')) return;
 
   stopSpeech();
-  state.text = '';
-  state.pages = 0;
+  state.pages = [];
   state.idx = 0;
   state.finished = false;
   state.sentences = [];
+  try { await dbClear(); } catch (e) { console.error(e); }
   localStorage.removeItem(LS.text);
   localStorage.removeItem(LS.pages);
   localStorage.removeItem(LS.idx);
+  if (state.pageUrls) {
+    state.pageUrls.forEach((u) => {
+      try { URL.revokeObjectURL(u); } catch (e) { /* 忽略 */ }
+    });
+    state.pageUrls = [];
+  }
   $('#textView').innerHTML = '';
   closeSettings();
   showEmpty();
@@ -1474,16 +1683,6 @@ function bindEvents() {
     if (Number.isFinite(i)) seekTo(i);
   });
 
-  // 字号
-  $('#btnFontUp').addEventListener('click', () => {
-    state.fontSize = Math.min(30, state.fontSize + 1);
-    applyFontSize();
-  });
-  $('#btnFontDown').addEventListener('click', () => {
-    state.fontSize = Math.max(15, state.fontSize - 1);
-    applyFontSize();
-  });
-
   // 设置
   $('#btnSettings').addEventListener('click', openSettings);
   $('#btnCloseSettings').addEventListener('click', closeSettings);
@@ -1510,9 +1709,6 @@ function bindEvents() {
     localStorage.setItem(LS.autoScroll, state.autoScroll ? '1' : '0');
   });
 
-  $('#btnEdit').addEventListener('click', openEditor);
-  $('#btnEditCancel').addEventListener('click', cancelEditor);
-  $('#btnEditSave').addEventListener('click', saveEditor);
   $('#btnCopy').addEventListener('click', copyAll);
   $('#btnDownload').addEventListener('click', downloadTxt);
   $('#btnClear').addEventListener('click', clearAll);
