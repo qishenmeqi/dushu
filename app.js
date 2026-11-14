@@ -52,6 +52,14 @@ function init() {
   bindEvents();
   initAudio();
   restoreReading();
+
+  if (isOnlineHost()) {
+    const tip = document.querySelector('#emptyState .tip');
+    if (tip) {
+      tip.textContent =
+        '线上版第一次识别要下载约 6MB 识别包，网络慢时可能要几分钟。手机在家建议连电脑的局域网地址，会快很多。';
+    }
+  }
 }
 
 /* ---------------- 设置读写 ---------------- */
@@ -743,14 +751,66 @@ function onOcrProgress(m) {
 
 const ASSET_BASE = new URL('.', location.href).href;   // 页面所在目录，末尾带斜杠
 
+// 线上访问时网络往往很慢，用精简语言包（1.7MB）而不是完整版（11.4MB）
+function isOnlineHost() {
+  const h = location.hostname;
+  return !(
+    h === 'localhost' ||
+    h === '127.0.0.1' ||
+    h === '' ||
+    /^192\.168\./.test(h) ||
+    /^10\./.test(h) ||
+    /^172\.(1[6-9]|2\d|3[01])\./.test(h)
+  );
+}
+
+function tessdataPath() {
+  return ASSET_BASE + 'vendor/' + (isOnlineHost() ? 'tessdata-fast' : 'tessdata');
+}
+
+// 先把语言包下载下来并显示真实进度，别让界面一直停在 0%
+async function warmLanguageFile(url) {
+  try {
+    const res = await fetch(url, { cache: 'default' });
+    if (!res.ok || !res.body) return;
+    const total = Number(res.headers.get('Content-Length')) || 0;
+    const reader = res.body.getReader();
+    let got = 0;
+    let last = 0;
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      got += value.length;
+      const now = Date.now();
+      if (now - last > 200 || got === total) {
+        last = now;
+        const pct = total ? Math.round((got / total) * 100) : null;
+        setOverlay(
+          '正在下载中文识别包',
+          pct !== null
+            ? `${pct}% · ${(got / 1048576).toFixed(1)} / ${(total / 1048576).toFixed(1)} MB`
+            : `${(got / 1048576).toFixed(1)} MB`
+        );
+        if (pct !== null) setBar(pct / 100);
+      }
+    }
+  } catch (e) {
+    /* 下载失败就让 Tesseract 自己再试一次 */
+  }
+}
+
 async function ensureWorker() {
   if (state.worker) return state.worker;
   if (!window.Tesseract) throw new Error('no-tesseract');
 
+  const langPath = tessdataPath();
+  await warmLanguageFile(langPath + '/chi_sim.traineddata.gz');
+
   const worker = await Tesseract.createWorker('chi_sim', 1, {
     workerPath: ASSET_BASE + 'vendor/worker.min.js',
     corePath: ASSET_BASE + 'vendor',
-    langPath: ASSET_BASE + 'vendor/tessdata',
+    langPath,
     logger: onOcrProgress,
   });
   state.worker = worker;
