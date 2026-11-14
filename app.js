@@ -1779,3 +1779,12 @@ function bindEvents() {
     }
   });
 }
+
+// 注册 Service Worker：添加到主屏幕后可以像 app 一样全屏打开
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', () => {
+    navigator.serviceWorker.register('sw.js').catch(() => {
+      /* 不支持就算了，不影响网页使用 */
+    });
+  });
+}
