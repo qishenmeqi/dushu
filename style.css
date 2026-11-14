@@ -374,6 +374,10 @@ button {
   font-variant-numeric: tabular-nums;
 }
 
+.synth-status {
+  color: var(--accent);
+}
+
 .dot { opacity: .5; }
 
 /* ---------- 设置抽屉 ---------- */

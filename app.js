@@ -172,6 +172,13 @@ async function restoreReading() {
   }
   if (state.pages.length) render();
   else showEmpty();
+
+  // 本机使用时，空闲后先把语音引擎装好，第一次点播放就不用等太久
+  if (state.pages.length && !isOnlineHost()) {
+    setTimeout(() => {
+      if (!state.piper && !state.piperPromise) ensurePiper().catch(() => {});
+    }, 2000);
+  }
 }
 
 function saveIdx() {
@@ -664,6 +671,11 @@ function clearAudioCache() {
   state.audioCache.clear();
 }
 
+function setSynthStatus(on) {
+  const el = $('#synthStatus');
+  if (el) el.classList.toggle('hidden', !on);
+}
+
 async function playCurrentSentence() {
   if (!state.playing || state.paused) return;
   if (!state.sentences.length) return;
@@ -680,12 +692,14 @@ async function playCurrentSentence() {
 
   const playBtn = $('#btnPlay');
   if (playBtn) playBtn.classList.add('loading');
+  setSynthStatus(true);
 
   let item;
   try {
     item = await getAudioFor(idx);
   } catch (e) {
     if (playBtn) playBtn.classList.remove('loading');
+    setSynthStatus(false);
     if (token !== state.synthToken) return;
     console.error(e);
     if (state.piperFailed) {
@@ -697,6 +711,7 @@ async function playCurrentSentence() {
     return;
   }
   if (playBtn) playBtn.classList.remove('loading');
+  setSynthStatus(false);
 
   if (token !== state.synthToken || !state.playing || state.idx !== idx) return;
 
@@ -762,7 +777,11 @@ function playFromCurrent() {
   requestWakeLock();
 
   if (!state.piper && !state.piperPromise) {
-    toast('正在加载离线语音，第一次要十几秒');
+    if (isOnlineHost()) {
+      toast('线上语音包有 155MB，要下载很久。想听朗读建议用电脑本地的地址');
+    } else {
+      toast('正在加载离线语音，第一次要十几秒');
+    }
   }
   if (state.volume === 0) {
     toast('音量是 0，先在设置里把音量拉大');
@@ -790,6 +809,7 @@ function stopSpeech() {
   if (state.audio) state.audio.pause();
   const playBtn = $('#btnPlay');
   if (playBtn) playBtn.classList.remove('loading');
+  setSynthStatus(false);
   updatePlayButton();
   releaseWakeLock();
 }
@@ -802,6 +822,7 @@ function finishPlayback() {
   if (state.audio) state.audio.pause();
   const playBtn = $('#btnPlay');
   if (playBtn) playBtn.classList.remove('loading');
+  setSynthStatus(false);
   updatePlayButton();
   releaseWakeLock();
   setCurrent(state.sentences.length - 1);
